@@ -458,7 +458,7 @@ def get_cell_display(game, r, c, anim_cells=None):
         return FLAG_CH, curses.color_pair(12) | curses.A_BOLD
     elif game.question[r][c]:
         return QUESTION_CH, curses.color_pair(23) | curses.A_BOLD
-    elif game.game_over and game.board[r][c] == -1:
+    elif game.game_over and game.board[r][c] == -1 and not getattr(game, "animating_explosion", False):
         return MINE_CH, curses.color_pair(13)
     else:
         return UNREVEALED, curses.color_pair(10)
@@ -625,21 +625,89 @@ def animate_reveal(stdscr, game, newly_revealed, difficulty_name, show_coords, c
     draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
 
 
+def board_layout(stdscr, game, show_coords=True, cell_w=3):
+    _, w = stdscr.getmaxyx()
+    cw = cell_w + 1
+    board_w = game.cols * cw + 1
+    coord_margin = 4 if show_coords else 0
+    col_offset = max(coord_margin, (w - board_w) // 2)
+    row_offset = 5 if show_coords else 4
+    return col_offset, row_offset, board_w, cw
+
+
+def cell_position(stdscr, game, r, c, show_coords=True, cell_w=3):
+    col_offset, row_offset, _, cw = board_layout(stdscr, game, show_coords, cell_w)
+    return row_offset + r * 2, col_offset + 1 + c * cw
+
+
+def draw_explosion_cells(stdscr, game, cells, text, attr, show_coords, cell_w):
+    for r, c in cells:
+        y, x = cell_position(stdscr, game, r, c, show_coords, cell_w)
+        label = text[:cell_w].center(cell_w)
+        sa(stdscr, y, x, label, attr)
+
+
 def animate_explosion(stdscr, game, difficulty_name, show_coords, cell_w):
     if not game.exploded:
         return
 
     er, ec = game.exploded
-    max_dist = max(game.rows, game.cols)
+    game.animating_explosion = True
+    mines_by_distance = []
+    max_dist = 0
+    for r in range(game.rows):
+        for c in range(game.cols):
+            dist = abs(r - er) + abs(c - ec)
+            max_dist = max(max_dist, dist)
+            if game.board[r][c] == -1:
+                mines_by_distance.append((dist, r, c))
+    mines_by_distance.sort()
 
-    for dist in range(max_dist + 1):
-        for r in range(game.rows):
-            for c in range(game.cols):
-                d = abs(r - er) + abs(c - ec)
-                if d == dist and game.board[r][c] == -1 and (r, c) != game.exploded:
-                    game.revealed[r][c] = True
+    impact_cells = [
+        (er + dr, ec + dc)
+        for dr in range(-1, 2)
+        for dc in range(-1, 2)
+        if 0 <= er + dr < game.rows and 0 <= ec + dc < game.cols
+    ]
+
+    # Impact flash: make the blast feel immediate before the wave expands.
+    for text, pair, delay in (("!!!", 28, 0.08), ("***", 21, 0.06), ("!!!", 18, 0.05)):
         draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
-        delay = 0.04 if dist < 5 else 0.02
+        draw_explosion_cells(stdscr, game, impact_cells, text, curses.color_pair(pair) | curses.A_BOLD, show_coords, cell_w)
+        stdscr.refresh()
+        time.sleep(delay)
+
+    revealed_mine_index = 0
+    for dist in range(max_dist + 1):
+        while revealed_mine_index < len(mines_by_distance) and mines_by_distance[revealed_mine_index][0] <= dist:
+            _, r, c = mines_by_distance[revealed_mine_index]
+            if (r, c) != game.exploded:
+                game.revealed[r][c] = True
+            revealed_mine_index += 1
+
+        ring = [
+            (r, c)
+            for r in range(game.rows)
+            for c in range(game.cols)
+            if abs(r - er) + abs(c - ec) == dist
+        ]
+        draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
+        if ring:
+            wave_text = "▒" * cell_w if dist % 2 else "▓" * cell_w
+            wave_pair = 21 if dist % 2 else 28
+            draw_explosion_cells(stdscr, game, ring, wave_text, curses.color_pair(wave_pair) | curses.A_BOLD, show_coords, cell_w)
+            stdscr.refresh()
+        delay = 0.055 if dist < 4 else 0.025
+        time.sleep(delay)
+
+    game.animating_explosion = False
+
+    # Final ember pulse over every mine so the finished board still feels animated.
+    mine_cells = [(r, c) for _, r, c in mines_by_distance]
+    for text, pair, delay in (("✹", 18, 0.08), ("*", 21, 0.07), ("✹", 13, 0.06)):
+        draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
+        draw_explosion_cells(stdscr, game, mine_cells, text, curses.color_pair(pair) | curses.A_BOLD, show_coords, cell_w)
+        stdscr.refresh()
         time.sleep(delay)
 
 
