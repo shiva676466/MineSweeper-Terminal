@@ -96,12 +96,35 @@ THEME_NAMES = list(THEMES.keys())
 
 # ── Config ────────────────────────────────────────────────────
 
+DEFAULT_CONFIG = {"theme": "Classic", "show_coords": True, "zoom": 0}
+
+
+def normalize_config(cfg):
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    theme = cfg.get("theme", DEFAULT_CONFIG["theme"])
+    if theme not in THEMES:
+        theme = DEFAULT_CONFIG["theme"]
+
+    show_coords = cfg.get("show_coords", DEFAULT_CONFIG["show_coords"])
+    if not isinstance(show_coords, bool):
+        show_coords = DEFAULT_CONFIG["show_coords"]
+
+    zoom = cfg.get("zoom", DEFAULT_CONFIG["zoom"])
+    if not isinstance(zoom, int):
+        zoom = DEFAULT_CONFIG["zoom"]
+    zoom = max(-1, min(2, zoom))
+
+    return {"theme": theme, "show_coords": show_coords, "zoom": zoom}
+
+
 def load_config():
     try:
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"theme": "Classic", "show_coords": True, "zoom": 0}
+            return normalize_config(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return DEFAULT_CONFIG.copy()
 
 
 def save_config(cfg):
@@ -113,6 +136,12 @@ def save_config(cfg):
 
 class Minesweeper:
     def __init__(self, rows=16, cols=30, mines=99):
+        if rows <= 0 or cols <= 0:
+            raise ValueError("rows and cols must be positive")
+        max_mines = rows * cols - 1
+        if mines < 0 or mines > max_mines:
+            raise ValueError(f"mines must be between 0 and {max_mines}")
+
         self.rows = rows
         self.cols = cols
         self.mines = mines
@@ -140,6 +169,10 @@ class Minesweeper:
                 safe.add((safe_r + dr, safe_c + dc))
 
         positions = [(r, c) for r in range(self.rows) for c in range(self.cols) if (r, c) not in safe]
+        if self.mines > len(positions):
+            safe = {(safe_r, safe_c)}
+            positions = [(r, c) for r in range(self.rows) for c in range(self.cols) if (r, c) not in safe]
+
         mine_positions = random.sample(positions, self.mines)
 
         for r, c in mine_positions:
@@ -425,7 +458,7 @@ def get_cell_display(game, r, c, anim_cells=None):
         return FLAG_CH, curses.color_pair(12) | curses.A_BOLD
     elif game.question[r][c]:
         return QUESTION_CH, curses.color_pair(23) | curses.A_BOLD
-    elif game.game_over and game.board[r][c] == -1:
+    elif game.game_over and game.board[r][c] == -1 and not getattr(game, "animating_explosion", False):
         return MINE_CH, curses.color_pair(13)
     else:
         return UNREVEALED, curses.color_pair(10)
@@ -592,21 +625,89 @@ def animate_reveal(stdscr, game, newly_revealed, difficulty_name, show_coords, c
     draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
 
 
+def board_layout(stdscr, game, show_coords=True, cell_w=3):
+    _, w = stdscr.getmaxyx()
+    cw = cell_w + 1
+    board_w = game.cols * cw + 1
+    coord_margin = 4 if show_coords else 0
+    col_offset = max(coord_margin, (w - board_w) // 2)
+    row_offset = 5 if show_coords else 4
+    return col_offset, row_offset, board_w, cw
+
+
+def cell_position(stdscr, game, r, c, show_coords=True, cell_w=3):
+    col_offset, row_offset, _, cw = board_layout(stdscr, game, show_coords, cell_w)
+    return row_offset + r * 2, col_offset + 1 + c * cw
+
+
+def draw_explosion_cells(stdscr, game, cells, text, attr, show_coords, cell_w):
+    for r, c in cells:
+        y, x = cell_position(stdscr, game, r, c, show_coords, cell_w)
+        label = text[:cell_w].center(cell_w)
+        sa(stdscr, y, x, label, attr)
+
+
 def animate_explosion(stdscr, game, difficulty_name, show_coords, cell_w):
     if not game.exploded:
         return
 
     er, ec = game.exploded
-    max_dist = max(game.rows, game.cols)
+    game.animating_explosion = True
+    mines_by_distance = []
+    max_dist = 0
+    for r in range(game.rows):
+        for c in range(game.cols):
+            dist = abs(r - er) + abs(c - ec)
+            max_dist = max(max_dist, dist)
+            if game.board[r][c] == -1:
+                mines_by_distance.append((dist, r, c))
+    mines_by_distance.sort()
 
-    for dist in range(max_dist + 1):
-        for r in range(game.rows):
-            for c in range(game.cols):
-                d = abs(r - er) + abs(c - ec)
-                if d == dist and game.board[r][c] == -1 and (r, c) != game.exploded:
-                    game.revealed[r][c] = True
+    impact_cells = [
+        (er + dr, ec + dc)
+        for dr in range(-1, 2)
+        for dc in range(-1, 2)
+        if 0 <= er + dr < game.rows and 0 <= ec + dc < game.cols
+    ]
+
+    # Impact flash: make the blast feel immediate before the wave expands.
+    for text, pair, delay in (("!!!", 28, 0.08), ("***", 21, 0.06), ("!!!", 18, 0.05)):
         draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
-        delay = 0.04 if dist < 5 else 0.02
+        draw_explosion_cells(stdscr, game, impact_cells, text, curses.color_pair(pair) | curses.A_BOLD, show_coords, cell_w)
+        stdscr.refresh()
+        time.sleep(delay)
+
+    revealed_mine_index = 0
+    for dist in range(max_dist + 1):
+        while revealed_mine_index < len(mines_by_distance) and mines_by_distance[revealed_mine_index][0] <= dist:
+            _, r, c = mines_by_distance[revealed_mine_index]
+            if (r, c) != game.exploded:
+                game.revealed[r][c] = True
+            revealed_mine_index += 1
+
+        ring = [
+            (r, c)
+            for r in range(game.rows)
+            for c in range(game.cols)
+            if abs(r - er) + abs(c - ec) == dist
+        ]
+        draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
+        if ring:
+            wave_text = "▒" * cell_w if dist % 2 else "▓" * cell_w
+            wave_pair = 21 if dist % 2 else 28
+            draw_explosion_cells(stdscr, game, ring, wave_text, curses.color_pair(wave_pair) | curses.A_BOLD, show_coords, cell_w)
+            stdscr.refresh()
+        delay = 0.055 if dist < 4 else 0.025
+        time.sleep(delay)
+
+    game.animating_explosion = False
+
+    # Final ember pulse over every mine so the finished board still feels animated.
+    mine_cells = [(r, c) for _, r, c in mines_by_distance]
+    for text, pair, delay in (("✹", 18, 0.08), ("*", 21, 0.07), ("✹", 13, 0.06)):
+        draw(stdscr, game, difficulty_name=difficulty_name, show_coords=show_coords, cell_w=cell_w)
+        draw_explosion_cells(stdscr, game, mine_cells, text, curses.color_pair(pair) | curses.A_BOLD, show_coords, cell_w)
+        stdscr.refresh()
         time.sleep(delay)
 
 
