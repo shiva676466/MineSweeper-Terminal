@@ -96,12 +96,35 @@ THEME_NAMES = list(THEMES.keys())
 
 # ── Config ────────────────────────────────────────────────────
 
+DEFAULT_CONFIG = {"theme": "Classic", "show_coords": True, "zoom": 0}
+
+
+def normalize_config(cfg):
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    theme = cfg.get("theme", DEFAULT_CONFIG["theme"])
+    if theme not in THEMES:
+        theme = DEFAULT_CONFIG["theme"]
+
+    show_coords = cfg.get("show_coords", DEFAULT_CONFIG["show_coords"])
+    if not isinstance(show_coords, bool):
+        show_coords = DEFAULT_CONFIG["show_coords"]
+
+    zoom = cfg.get("zoom", DEFAULT_CONFIG["zoom"])
+    if not isinstance(zoom, int):
+        zoom = DEFAULT_CONFIG["zoom"]
+    zoom = max(-1, min(2, zoom))
+
+    return {"theme": theme, "show_coords": show_coords, "zoom": zoom}
+
+
 def load_config():
     try:
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"theme": "Classic", "show_coords": True, "zoom": 0}
+            return normalize_config(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return DEFAULT_CONFIG.copy()
 
 
 def save_config(cfg):
@@ -113,6 +136,12 @@ def save_config(cfg):
 
 class Minesweeper:
     def __init__(self, rows=16, cols=30, mines=99):
+        if rows <= 0 or cols <= 0:
+            raise ValueError("rows and cols must be positive")
+        max_mines = rows * cols - 1
+        if mines < 0 or mines > max_mines:
+            raise ValueError(f"mines must be between 0 and {max_mines}")
+
         self.rows = rows
         self.cols = cols
         self.mines = mines
@@ -140,6 +169,10 @@ class Minesweeper:
                 safe.add((safe_r + dr, safe_c + dc))
 
         positions = [(r, c) for r in range(self.rows) for c in range(self.cols) if (r, c) not in safe]
+        if self.mines > len(positions):
+            safe = {(safe_r, safe_c)}
+            positions = [(r, c) for r in range(self.rows) for c in range(self.cols) if (r, c) not in safe]
+
         mine_positions = random.sample(positions, self.mines)
 
         for r, c in mine_positions:
